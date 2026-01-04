@@ -108,6 +108,10 @@ function renderProgressBar(current, total) {
   return ` ${bar} ${chalk.bold(percent)}%`;
 }
 
+function getUserHome() {
+    return process.env.HOME || process.env.USERPROFILE;
+}
+
 async function startApp() {
   console.clear();
   console.log(chalk.white.bold("\n TIDAL PLAYLIST EXPORTER"));
@@ -137,7 +141,7 @@ async function startApp() {
 
     const playlistName = playlistData.data.attributes.name;
     const safeName = sanitizeFilename(playlistName);
-    const outputDir = path.join(process.cwd(), safeName);
+    const outputDir = path.join(path.join(getUserHome(), "Music/Playlist"), safeName);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
     const outputPath = path.join(outputDir, `${safeName}.json`);
 
@@ -237,7 +241,7 @@ async function startApp() {
     }
 
     readline.moveCursor(process.stdout, 0, 2);
-    console.log(chalk.bold.green(`\n [SUCCESS] JSON Saved\n`));
+    console.log(chalk.bold.green(`\n [SUCCESS] JSON Saved to ${outputPath}\n`));
 
   } catch (err) {
     console.error(chalk.red(`\n [CRITICAL] ${err.message}`));
