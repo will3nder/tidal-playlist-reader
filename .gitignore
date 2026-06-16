@@ -1,3 +1,4 @@
 .env
 tidalplaylistlist.txt
+.tidal_token_cache.json
 

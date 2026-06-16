@@ -4,6 +4,12 @@ import sys
 import json
 import time
 import base64
+import hashlib
+import secrets
+import threading
+import webbrowser
+import urllib.parse
+import http.server
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -12,13 +18,20 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REDIRECT_URI = "http://localhost:8888/callback"
 COUNTRY_CODE = "US"
 BASE_DELAY = 0.5
+TOKEN_CACHE_PATH = Path(".tidal_token_cache.json")
+SCOPES = "playlists.read"
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 
 def sleep(ms):
     time.sleep(ms / 1000)
 
-# --- Helpers ---
 def truncate(s, length=40):
     return s[:length] + "..." if len(s) > length else s
 
@@ -39,8 +52,7 @@ def normalize_tidal_url(link):
     elif not link.startswith("http"):
         link = "https://openapi.tidal.com/" + link
 
-    from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-    parsed = urlparse(link)
+    parsed = urllib.parse.urlparse(link)
     parsed = parsed._replace(scheme="https", netloc="openapi.tidal.com")
 
     path = parsed.path
@@ -48,29 +60,179 @@ def normalize_tidal_url(link):
         path = "/v2/" + path.lstrip("/")
         parsed = parsed._replace(path=path)
 
-    params = parse_qs(parsed.query, keep_blank_values=True)
+    params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     if "countryCode" not in params:
         params["countryCode"] = [COUNTRY_CODE]
     if "include" not in params:
         params["include"] = ["items"]
 
-    query = urlencode({k: v[0] for k, v in params.items()})
+    query = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
     parsed = parsed._replace(query=query)
-    return urlunparse(parsed)
+    return urllib.parse.urlunparse(parsed)
 
-def get_access_token():
+def get_user_home():
+    return str(Path.home())
+
+
+# ─────────────────────────────────────────────
+# Auth
+# ─────────────────────────────────────────────
+
+def _basic_auth_header():
     credentials = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    return {"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"}
+
+def _save_token_cache(token_data):
+    with open(TOKEN_CACHE_PATH, "w") as f:
+        json.dump(token_data, f, indent=2)
+
+def _pkce_pair():
+    """Generate a PKCE code_verifier and S256 code_challenge."""
+    verifier  = secrets.token_urlsafe(64)
+    digest    = hashlib.sha256(verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return verifier, challenge
+
+def _try_refresh_token(refresh_token):
+    """Attempt to get a new access token using the cached refresh token."""
     res = requests.post(
         "https://auth.tidal.com/v1/oauth2/token",
-        headers={
-            "Authorization": f"Basic {credentials}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data="grant_type=client_credentials",
+        headers=_basic_auth_header(),
+        data=urllib.parse.urlencode({
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh_token,
+        }),
     )
+    if res.ok:
+        token_data = res.json()
+        _save_token_cache(token_data)
+        print(" [*] Token refreshed from cache.")
+        return token_data["access_token"]
+    return None
+
+def _auth_code_flow():
+    """Full browser-based OAuth2 authorization code flow with PKCE (S256)."""
+    code_verifier, code_challenge = _pkce_pair()
+
+    auth_params = {
+        "response_type":         "code",
+        "client_id":             CLIENT_ID,
+        "redirect_uri":          REDIRECT_URI,
+        "scope":                 SCOPES,
+        "code_challenge":        code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = "https://login.tidal.com/authorize?" + urllib.parse.urlencode(auth_params)
+
+    print(f"\n [*] Opening browser for TIDAL login...")
+    print(f" [*] If the browser doesn't open, visit:\n     {auth_url}\n")
+
+    auth_code  = [None]
+    auth_error = [None]
+    done       = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            # Ignore favicon silently
+            if self.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+
+            if "code" in params:
+                auth_code[0] = params["code"][0]
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"<h2>Authentication successful! You can close this tab.</h2>")
+                done.set()
+            elif "error" in params:
+                error = params["error"][0]
+                desc  = params.get("error_description", ["No description"])[0]
+                auth_error[0] = f"{error}: {desc}"
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(
+                    f"<h2>Authentication failed</h2><p>{auth_error[0]}</p>".encode()
+                )
+                done.set()
+            else:
+                self.send_response(200)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass  # Suppress server logs
+
+    server = http.server.HTTPServer(("localhost", 8888), CallbackHandler)
+    server.timeout = 1
+
+    def _serve():
+        while not done.is_set():
+            server.handle_request()
+        server.server_close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    webbrowser.open(auth_url)
+    completed = done.wait(timeout=120)
+
+    if not completed:
+        server.server_close()
+        raise Exception("Authentication timed out (120s). Make sure you completed the login in the browser.")
+
+    if auth_error[0]:
+        raise Exception(f"TIDAL auth error — {auth_error[0]}")
+
+    if not auth_code[0]:
+        raise Exception("No auth code received. Check that the redirect URI is registered in the TIDAL Developer Portal.")
+
+    # Exchange the auth code for tokens — must include code_verifier to match the challenge
+    res = requests.post(
+        "https://auth.tidal.com/v1/oauth2/token",
+        headers=_basic_auth_header(),
+        data=urllib.parse.urlencode({
+            "grant_type":    "authorization_code",
+            "code":          auth_code[0],
+            "redirect_uri":  REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }),
+    )
+
     if not res.ok:
-        raise Exception("Authentication failed.")
-    return res.json()["access_token"]
+        raise Exception(f"Token exchange failed: {res.status_code} — {res.text}")
+
+    token_data = res.json()
+    _save_token_cache(token_data)
+    print(" [+] Authentication successful. Token cached.")
+    return token_data["access_token"]
+
+def get_access_token():
+    """
+    Returns a valid access token.
+    Priority:
+      1. Refresh cached token if available
+      2. Full browser OAuth2 + PKCE flow
+    """
+    if TOKEN_CACHE_PATH.exists():
+        try:
+            with open(TOKEN_CACHE_PATH) as f:
+                cached = json.load(f)
+            if "refresh_token" in cached:
+                token = _try_refresh_token(cached["refresh_token"])
+                if token:
+                    return token
+        except (json.JSONDecodeError, KeyError):
+            pass  # Cache corrupted — fall through to fresh login
+
+    return _auth_code_flow()
+
+
+# ─────────────────────────────────────────────
+# API
+# ─────────────────────────────────────────────
 
 def fetch_with_retry(url, access_token, retries=5):
     for _ in range(retries):
@@ -86,14 +248,14 @@ def fetch_with_retry(url, access_token, retries=5):
             sys.stdout.flush()
             time.sleep(cut_wait / 1000)
             continue
-        # Return response directly for higher-level error handling (like 400s)
         return res
-    raise Exception("Timeout")
+    raise Exception("Max retries exceeded.")
 
-def get_user_home():
-    return str(Path.home())
 
-# --- Input Helpers ---
+# ─────────────────────────────────────────────
+# Input Helpers
+# ─────────────────────────────────────────────
+
 def ask_question(query):
     return input(query)
 
@@ -124,14 +286,14 @@ def prompt_400_error(ref_id):
             ch = sys.stdin.read(1)
             if ch == "\x1b":
                 ch2 = sys.stdin.read(2)
-                if ch2 == "[A":   # Up
+                if ch2 == "[A":
                     selected[0] = max(0, selected[0] - 1)
-                elif ch2 == "[B": # Down
+                elif ch2 == "[B":
                     selected[0] = min(len(options) - 1, selected[0] + 1)
                 render()
-            elif ch == "\r":      # Enter
+            elif ch == "\r":
                 break
-            elif ch == "\x03":    # Ctrl+C
+            elif ch == "\x03":
                 sys.exit()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -142,7 +304,11 @@ def prompt_400_error(ref_id):
         return {"action": "url", "url": new_url}
     return {"action": choice.lower()}
 
-# --- File System Navigator ---
+
+# ─────────────────────────────────────────────
+# File Navigator
+# ─────────────────────────────────────────────
+
 def file_navigator(start_dir):
     import tty
     import termios
@@ -187,11 +353,11 @@ def file_navigator(start_dir):
             items = get_items()
             if ch == "\x1b":
                 ch2 = sys.stdin.read(2)
-                if ch2 == "[A":   # Up
+                if ch2 == "[A":
                     selected[0] = max(0, selected[0] - 1)
-                elif ch2 == "[B": # Down
+                elif ch2 == "[B":
                     selected[0] = min(len(items) - 1, selected[0] + 1)
-            elif ch == "\r":      # Enter
+            elif ch == "\r":
                 item = items[selected[0]]
                 new_path = (current_dir / item["name"]).resolve()
                 if item["is_dir"]:
@@ -199,10 +365,10 @@ def file_navigator(start_dir):
                     selected[0] = 0
                 else:
                     result[0] = str(new_path)
-            elif ch == "\x7f":    # Backspace
+            elif ch == "\x7f":
                 current_dir = current_dir.parent
                 selected[0] = 0
-            elif ch == "\x03":    # Ctrl+C
+            elif ch == "\x03":
                 sys.exit()
             render()
     finally:
@@ -210,7 +376,11 @@ def file_navigator(start_dir):
 
     return result[0]
 
-# --- Main Processing Logic ---
+
+# ─────────────────────────────────────────────
+# Playlist Processing
+# ─────────────────────────────────────────────
+
 def process_playlist(playlist_id, token):
     playlist_meta_url = normalize_tidal_url(f"/playlists/{playlist_id}")
     res = fetch_with_retry(playlist_meta_url, token)
@@ -265,11 +435,11 @@ def process_playlist(playlist_id, token):
                         final_tracks.append({"order": track_order, "id": ref["id"], "status": "skipped"})
                         success = True
                     elif decision["action"] == "retry":
-                        continue  # Loop again
+                        continue
                     elif decision["action"] == "url":
                         new_id = extract_playlist_id(decision["url"])
                         if new_id:
-                            ref["id"] = new_id  # Update ID and retry
+                            ref["id"] = new_id
                             continue
                         else:
                             print(" Invalid URL provided.")
@@ -286,12 +456,12 @@ def process_playlist(playlist_id, token):
                         album = next((x["attributes"]["title"] for x in included if x["type"] == "albums"), "Unknown Album")
 
                         final_tracks.append({
-                            "order": track_order,
-                            "title": track["attributes"]["title"],
+                            "order":   track_order,
+                            "title":   track["attributes"]["title"],
                             "artists": raw_artists,
-                            "album": album,
-                            "id": ref["id"],
-                            "isrc": track["attributes"].get("isrc"),
+                            "album":   album,
+                            "id":      ref["id"],
+                            "isrc":    track["attributes"].get("isrc"),
                         })
                         print(f" {progress_label} Processing \"{truncate(track['attributes']['title'], 30)}\"")
                         success = True
@@ -308,7 +478,11 @@ def process_playlist(playlist_id, token):
 
     print(f"\n [SUCCESS] JSON Saved to {output_path}\n")
 
-# --- Menu UI ---
+
+# ─────────────────────────────────────────────
+# Menu UI
+# ─────────────────────────────────────────────
+
 def start_app():
     import tty
     import termios
@@ -319,7 +493,7 @@ def start_app():
     sys.stdout.flush()
 
     if not CLIENT_ID or not CLIENT_SECRET:
-        sys.stdout.write(" [ERROR] Missing credentials in .env\r\n")
+        sys.stdout.write(" [ERROR] Missing CLIENT_ID or CLIENT_SECRET in .env\r\n")
         sys.stdout.flush()
         sys.exit(1)
 
@@ -349,14 +523,14 @@ def start_app():
             ch = sys.stdin.read(1)
             if ch == "\x1b":
                 ch2 = sys.stdin.read(2)
-                if ch2 == "[A":   # Up
+                if ch2 == "[A":
                     selected[0] = 0
-                elif ch2 == "[B": # Down
+                elif ch2 == "[B":
                     selected[0] = 1
-            elif ch == "\r":      # Enter
+            elif ch == "\r":
                 mode_choice[0] = modes[selected[0]]
                 break
-            elif ch == "\x03":    # Ctrl+C
+            elif ch == "\x03":
                 sys.exit()
 
             sys.stdout.write("\033[3A\033[0J")
@@ -391,5 +565,6 @@ def start_app():
             process_playlist(playlist_id, token)
     except Exception as err:
         print(f"\n [CRITICAL] {err}")
+
 
 start_app()
